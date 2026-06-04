@@ -1,0 +1,8 @@
+workerNodeIp: "dynamic"
+controlPlaneAddress: ""
+port: "10010"
+verbosity: "info"
+criType: "containerd"
+criPath: "/run/containerd/containerd.sock"
+cniConfigPath: "/etc/cni/net.d/10-flannel.conflist"
+prefetchImage: true
