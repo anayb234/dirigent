@@ -140,6 +140,20 @@ func registrationHandler(cpApi *api.CpApiServer) func(w http.ResponseWriter, r *
 
 			autoscalingConfig.ScalingLowerBound = int32(lowerBound)
 		}
+		if len(r.FormValue("scaling_period")) != 0 {
+			// Seconds; "0" = tick as fast as possible (100ms loop) so
+			// benchmarks can separate decision latency from creation latency.
+			periodS, err := strconv.Atoi(r.FormValue("scaling_period"))
+			if err != nil {
+				http.Error(w, "Invalid scaling period.", http.StatusBadRequest)
+				return
+			}
+			if periodS == 0 {
+				autoscalingConfig.ScalingPeriodSeconds = -1
+			} else {
+				autoscalingConfig.ScalingPeriodSeconds = int32(periodS)
+			}
+		}
 
 		var service *proto.ActionStatus
 		if cpApi.LeaderElectionServer.IsLeader() {

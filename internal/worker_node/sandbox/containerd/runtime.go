@@ -37,6 +37,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/emptypb"
+	"sync"
 	"time"
 )
 
@@ -52,6 +53,10 @@ type ContainerdRuntime struct {
 	ImageManager   *ImageManager
 	SandboxManager *managers.SandboxManager
 	ProcessMonitor *managers.ProcessMonitor
+	startTimings   sync.Map // sandbox ID -> StartTimings
+
+	precreateCreateOptions ContainerCreateOptions
+	skipIptables           bool // true for PhantomK8s (direct container-IP proxy); false restores upstream hostPort DNAT
 }
 
 type ContainerdMetadata struct {
@@ -65,7 +70,7 @@ func NewContainerdRuntime(cpApi proto.CpiInterfaceClient, config config.WorkerNo
 	containerdClient := GetContainerdClient(config.CRIPath)
 
 	imageManager := NewContainerdImageManager()
-	cniClient := GetCNIClient(config.CNIConfigPath)
+	cniClient := GetCNIClient(config.CNIConfigPath, config.CNIBinDir)
 	ipt, err := managers.NewIptablesUtil()
 
 	if err != nil {
@@ -96,6 +101,11 @@ func NewContainerdRuntime(cpApi proto.CpiInterfaceClient, config config.WorkerNo
 		ImageManager:   imageManager,
 		SandboxManager: sandboxManager,
 		ProcessMonitor: managers.NewProcessMonitor(),
+		precreateCreateOptions: ContainerCreateOptions{
+			RuncV2ShimGroup: config.PrecreateShimGroup,
+			RuntimeBinary:   config.PrecreateRuntimeBin,
+		},
+		skipIptables: config.SkipIptables,
 	}
 }
 
@@ -149,7 +159,13 @@ func (cr *ContainerdRuntime) CreateSandbox(grpcCtx context.Context, in *proto.Se
 
 	startIptables := time.Now()
 
-	managers.AddRules(cr.IPT, metadata.HostPort, metadata.IP, metadata.GuestPort)
+	// PhantomK8s (skipIptables=true) proxies to the container IP directly and
+	// needs no DNAT. Upstream Dirigent's data plane routes to workerIP:hostPort
+	// and depends on these PREROUTING/OUTPUT rules — restore them for the
+	// faithful Dirigent baseline arm.
+	if !cr.skipIptables {
+		managers.AddRules(cr.IPT, metadata.HostPort, metadata.IP, metadata.GuestPort)
+	}
 
 	durationIptables := time.Since(startIptables)
 
@@ -180,6 +196,243 @@ func (cr *ContainerdRuntime) CreateSandbox(grpcCtx context.Context, in *proto.Se
 	}, nil
 }
 
+// CreateSandboxInBundle creates a sandbox whose container joins a pre-created
+// PhantomK8s pool bundle netns (eth0/IP/route preconfigured). CNI is skipped
+// entirely; the pod IP is the bundle's pre-assigned IP. Metadata.NetNs is left
+// empty so DeleteContainer skips CNI removal — the caller reclaims the bundle.
+func (cr *ContainerdRuntime) CreateSandboxInBundle(grpcCtx context.Context, in *proto.ServiceInfo, netnsPath, ip string) (*proto.SandboxCreationStatus, error) {
+	logrus.Debug("Create sandbox (bundle netns) for service = '", in.Name, "'")
+
+	start := time.Now()
+
+	ctx := namespaces.WithNamespace(grpcCtx, "cm")
+	image, err, durationFetch := cr.ImageManager.GetImage(ctx, cr.ContainerdClient, in.Image)
+
+	if err != nil {
+		logrus.Warn("Failed fetching image - ", err)
+		return &proto.SandboxCreationStatus{Success: false}, err
+	}
+
+	container, err, durationContainerCreation := CreateContainerInNetNS(ctx, cr.ContainerdClient, image, netnsPath)
+	if err != nil {
+		logrus.Warn("Failed creating a container - ", err)
+		return &proto.SandboxCreationStatus{Success: false}, err
+	}
+
+	task, _, err, durationContainerStart, startTimings := StartContainerPrenetworked(ctx, container)
+	if err != nil {
+		logrus.Warn("Failed starting a container - ", err)
+		return &proto.SandboxCreationStatus{Success: false}, err
+	}
+	cr.startTimings.Store(container.ID(), startTimings)
+
+	startConfigureMonitoring := time.Now()
+	metadata := &managers.Metadata{
+		ServiceName: in.Name,
+
+		RuntimeMetadata: ContainerdMetadata{
+			Task:      task,
+			Container: container,
+		},
+
+		HostPort:  AssignRandomPort(),
+		IP:        ip,
+		GuestPort: int(in.PortForwarding.GuestPort),
+		NetNs:     "", // bundle-owned netns; CNI removal must be skipped
+
+		ExitStatusChannel: make(chan uint32),
+	}
+
+	cr.ProcessMonitor.AddChannel(task.Pid(), metadata.ExitStatusChannel)
+	cr.SandboxManager.AddSandbox(container.ID(), metadata)
+	configureMonitoringDuration := time.Since(startConfigureMonitoring)
+
+	logrus.Debug("Sandbox creation (bundle) took ", time.Since(start).Microseconds(), " μs (", container.ID(), ")")
+
+	in.PortForwarding.HostPort = int32(metadata.HostPort)
+
+	go WatchExitChannel(cr.cpApi, metadata, func(metadata *managers.Metadata) string {
+		return metadata.RuntimeMetadata.(ContainerdMetadata).Container.ID()
+	})
+
+	return &proto.SandboxCreationStatus{
+		Success:      true,
+		ID:           container.ID(),
+		PortMappings: in.PortForwarding,
+		LatencyBreakdown: &proto.SandboxCreationBreakdown{
+			Total:               durationpb.New(time.Since(start)),
+			ImageFetch:          durationpb.New(durationFetch),
+			SandboxCreate:       durationpb.New(durationContainerCreation),
+			NetworkSetup:        durationpb.New(0), // CNI skipped — bundle netns pre-networked
+			SandboxStart:        durationpb.New(durationContainerStart),
+			Iptables:            durationpb.New(0),
+			ReadinessProbing:    durationpb.New(0),
+			SnapshotCreation:    durationpb.New(0),
+			ConfigureMonitoring: durationpb.New(configureMonitoringDuration),
+			FindSnapshot:        durationpb.New(0),
+		},
+	}, nil
+}
+
+// PrecreatedSandbox is a container whose task has been created (runc init
+// parked before execve) inside a pool bundle netns. The expensive half of the
+// launch — snapshot, shim spawn, runc create — is already paid; claiming it
+// costs only task.Start.
+type PrecreatedSandbox struct {
+	Container containerd.Container
+	Task      containerd.Task
+	IP        string
+	Image     string
+	NewTaskMs float64 // fill-time cost, for reporting
+	CreateMs  float64
+}
+
+// PrecreateSandboxInBundle pays image-lookup + NewContainer(+snapshot) +
+// NewTask (shim spawn + runc create) off the hot path and parks the task in
+// Created state. Pair with StartPrecreatedSandbox on claim or
+// DiscardPrecreatedSandbox on drain.
+//
+// Stages select how much of creation is prepaid:
+//   "task" (default): NewContainer + NewTask via the per-slot runc shim —
+//     parked runc-init held (shim 5.5MB + init 3.8MB per slot).
+//   "container": NewContainer + snapshot only (Task == nil), Tier-2 — no
+//     processes held; claim pays NewTask+Start. Also the isolation stage for
+//     the staged memory delta.
+//   "native": NewContainer + NewTask via the node-singleton rune shim — the
+//     parked init is a ~0.5MB C fork-server child; zero per-slot shims.
+func (cr *ContainerdRuntime) PrecreateSandboxInBundle(grpcCtx context.Context, imageName, netnsPath, ip, stage string) (*PrecreatedSandbox, error) {
+	ctx := namespaces.WithNamespace(grpcCtx, "cm")
+
+	image, err, _ := cr.ImageManager.GetImage(ctx, cr.ContainerdClient, imageName)
+	if err != nil {
+		return nil, err
+	}
+
+	createOpts := cr.precreateCreateOptions
+	if stage == "native" {
+		createOpts.RuneRuntime = true
+	}
+	container, err, durationCreate := CreateContainerInNetNSWithOptions(ctx, cr.ContainerdClient, image, netnsPath, createOpts)
+	if err != nil {
+		return nil, err
+	}
+
+	pre := &PrecreatedSandbox{
+		Container: container,
+		IP:        ip,
+		Image:     imageName,
+		CreateMs:  float64(durationCreate.Nanoseconds()) / 1e6,
+	}
+	if stage == "container" {
+		return pre, nil
+	}
+
+	task, err, durationNewTask := CreateParkedTask(ctx, container)
+	if err != nil {
+		// Roll back the container + snapshot so nothing leaks.
+		_ = container.Delete(ctx, containerd.WithSnapshotCleanup)
+		return nil, err
+	}
+	pre.Task = task
+	pre.NewTaskMs = float64(durationNewTask.Nanoseconds()) / 1e6
+	return pre, nil
+}
+
+// StartPrecreatedSandbox is the hot path for a precreated sandbox: Wait+Start
+// (unblock parked init -> execve) plus monitoring registration. SandboxCreate
+// is reported as 0 — that cost was paid at precreate time.
+func (cr *ContainerdRuntime) StartPrecreatedSandbox(grpcCtx context.Context, in *proto.ServiceInfo, pre *PrecreatedSandbox) (*proto.SandboxCreationStatus, error) {
+	start := time.Now()
+	ctx := namespaces.WithNamespace(grpcCtx, "cm")
+
+	// Tier-2 (container-only park): no shim/init held — pay NewTask at claim.
+	claimNewTask := time.Duration(0)
+	if pre.Task == nil {
+		task, terr, durationNewTask := CreateParkedTask(ctx, pre.Container)
+		if terr != nil {
+			logrus.Warn("Failed creating task for container-only precreated sandbox - ", terr)
+			return &proto.SandboxCreationStatus{Success: false}, terr
+		}
+		pre.Task = task
+		claimNewTask = durationNewTask
+	}
+
+	_, err, startTimings := StartParkedTask(ctx, pre.Task)
+	if err != nil {
+		logrus.Warn("Failed starting a precreated task - ", err)
+		return &proto.SandboxCreationStatus{Success: false}, err
+	}
+	startTimings.NewTask = claimNewTask
+	cr.startTimings.Store(pre.Container.ID(), startTimings)
+
+	startConfigureMonitoring := time.Now()
+	metadata := &managers.Metadata{
+		ServiceName: in.Name,
+
+		RuntimeMetadata: ContainerdMetadata{
+			Task:      pre.Task,
+			Container: pre.Container,
+		},
+
+		HostPort:  AssignRandomPort(),
+		IP:        pre.IP,
+		GuestPort: int(in.PortForwarding.GuestPort),
+		NetNs:     "", // bundle-owned netns; CNI removal must be skipped
+
+		ExitStatusChannel: make(chan uint32),
+	}
+
+	cr.ProcessMonitor.AddChannel(pre.Task.Pid(), metadata.ExitStatusChannel)
+	cr.SandboxManager.AddSandbox(pre.Container.ID(), metadata)
+	configureMonitoringDuration := time.Since(startConfigureMonitoring)
+
+	in.PortForwarding.HostPort = int32(metadata.HostPort)
+
+	go WatchExitChannel(cr.cpApi, metadata, func(metadata *managers.Metadata) string {
+		return metadata.RuntimeMetadata.(ContainerdMetadata).Container.ID()
+	})
+
+	return &proto.SandboxCreationStatus{
+		Success:      true,
+		ID:           pre.Container.ID(),
+		PortMappings: in.PortForwarding,
+		LatencyBreakdown: &proto.SandboxCreationBreakdown{
+			Total:               durationpb.New(time.Since(start)),
+			ImageFetch:          durationpb.New(0),
+			SandboxCreate:       durationpb.New(0), // paid at precreate time
+			NetworkSetup:        durationpb.New(0), // bundle netns pre-networked
+			SandboxStart:        durationpb.New(startTimings.Wait + startTimings.TaskStart),
+			Iptables:            durationpb.New(0),
+			ReadinessProbing:    durationpb.New(0),
+			SnapshotCreation:    durationpb.New(0),
+			ConfigureMonitoring: durationpb.New(configureMonitoringDuration),
+			FindSnapshot:        durationpb.New(0),
+		},
+	}, nil
+}
+
+// DiscardPrecreatedSandbox tears down a parked (never-started) precreated
+// sandbox: kill+delete the task (if one was created), delete the container
+// and its snapshot.
+func (cr *ContainerdRuntime) DiscardPrecreatedSandbox(grpcCtx context.Context, pre *PrecreatedSandbox) error {
+	ctx := namespaces.WithNamespace(grpcCtx, "cm")
+	if pre.Task != nil {
+		if _, err := pre.Task.Delete(ctx, containerd.WithProcessKill); err != nil {
+			logrus.Warn("discard precreated task: ", err)
+		}
+	}
+	return pre.Container.Delete(ctx, containerd.WithSnapshotCleanup)
+}
+
+func (cr *ContainerdRuntime) ConsumeStartTimings(sandboxID string) (StartTimings, bool) {
+	raw, ok := cr.startTimings.LoadAndDelete(sandboxID)
+	if !ok {
+		return StartTimings{}, false
+	}
+	timings, ok := raw.(StartTimings)
+	return timings, ok
+}
+
 func (cr *ContainerdRuntime) DeleteSandbox(grpcCtx context.Context, in *proto.SandboxID) (*proto.ActionStatus, error) {
 	logrus.Debug("RemoveKey sandbox with ID = '", in.ID, "'")
 
@@ -193,7 +446,10 @@ func (cr *ContainerdRuntime) DeleteSandbox(grpcCtx context.Context, in *proto.Sa
 
 	start := time.Now()
 
-	managers.DeleteRules(cr.IPT, metadata.HostPort, metadata.IP, metadata.GuestPort)
+	// PhantomK8s never added DNAT rules; the upstream Dirigent arm did.
+	if !cr.skipIptables {
+		managers.DeleteRules(cr.IPT, metadata.HostPort, metadata.IP, metadata.GuestPort)
+	}
 	UnassignPort(metadata.HostPort)
 	logrus.Debug("IP tables configuration (remove rule(s)) took ", time.Since(start).Microseconds(), " μs")
 

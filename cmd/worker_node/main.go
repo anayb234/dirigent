@@ -37,6 +37,7 @@ import (
 	"flag"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
+	"os"
 	"os/exec"
 	"strconv"
 )
@@ -94,6 +95,13 @@ func main() {
 }
 
 func resetIPTables() {
+	// Flushing the whole NAT table kills co-resident k3s networking
+	// (kube-proxy chains, flannel masquerade). Per-sandbox rules are removed
+	// in DeleteSandbox; only flush when explicitly requested on a dedicated node.
+	if os.Getenv("DIRIGENT_FLUSH_NAT") != "1" {
+		logrus.Info("Skipping NAT table flush (set DIRIGENT_FLUSH_NAT=1 on dedicated nodes)")
+		return
+	}
 	err := exec.Command("sudo", "iptables", "-t", "nat", "-F").Run()
 	if err != nil {
 		logrus.Errorf("Error reseting IP tables - %v", err.Error())

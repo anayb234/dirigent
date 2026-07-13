@@ -75,7 +75,11 @@ type WorkerNodeConfig struct {
 	CRIType             string   `mapstructure:"criType"`
 	CRIPath             string   `mapstructure:"criPath"`
 	CNIConfigPath       string   `mapstructure:"cniConfigPath"`
+	CNIBinDir           string   `mapstructure:"cniBinDir"`
 	PrefetchImage       bool     `mapstructure:"prefetchImage"`
+	PrecreateShimGroup  string   `mapstructure:"precreateShimGroup"`
+	PrecreateRuntimeBin string   `mapstructure:"precreateRuntimeBin"`
+	SkipIptables        bool     `mapstructure:"skipIptables"` // PhantomK8s proxies to container IPs directly; upstream Dirigent needs hostPort DNAT
 
 	FirecrackerKernel           string `mapstructure:"firecrackerKernel"`
 	FirecrackerFileSystem       string `mapstructure:"firecrackerFileSystem"`

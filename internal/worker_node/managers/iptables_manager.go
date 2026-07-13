@@ -61,16 +61,24 @@ func AddRules(ipt *iptables.IPTables, sourcePort int, destIP string, destPort in
 	}
 	logrus.Debugf("Added IP table rule for localhost traffic any:%d -> %s:%d", sourcePort, destIP, destPort)
 
+	// Upstream appends an UNCONDITIONAL MASQUERADE, which rewrites the source
+	// of loopback connections too (SYN to 127.0.0.1 leaves with the node IP and
+	// is dropped as a martian) — killing every localhost service on the node.
+	// Scope it off loopback; container egress NAT still works.
 	err = ipt.AppendUnique(
 		"nat",
 		"POSTROUTING",
+		"!", "-o", "lo",
 		"-j", "MASQUERADE",
 	)
 	if err != nil {
 		logrus.Errorf("Error adding a POSTROUTING MASQUERADE - %s", err.Error())
 	}
 
-	err = exec.Command("sudo", "iptables", "-P", "FORWARD", "ACCEPT").Run()
+	// No sudo: the worker already runs as root, and sudo resolves the local
+	// hostname first — on nodes with broken DNS that is a 40s stall PER SANDBOX
+	// (4 × 10s resolver attempts), which dominated every cold start.
+	err = exec.Command("iptables", "-P", "FORWARD", "ACCEPT").Run()
 	if err != nil {
 		logrus.Errorf("Error changing IP routing policy FORWARD ACCEPT - %s", err.Error())
 	}

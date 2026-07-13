@@ -56,10 +56,23 @@ func (c *ControlPlane) notifyDataplanesAndStartScalingLoop(ctx context.Context, 
 		startTime = time.Now()
 	}
 
+	// Upstream hardcoded the scaling period to 2s (their TODO); honor the
+	// per-function config instead so benchmarks can isolate decision-loop
+	// latency from creation latency. Sentinel -1 = "as fast as possible"
+	// (100ms — a zero ticker panics); 0/unset keeps the upstream 2s default.
+	scalingPeriod := 2 * time.Second
+	if cfg := serviceInfo.AutoscalingConfig; cfg != nil {
+		if cfg.ScalingPeriodSeconds > 0 {
+			scalingPeriod = time.Duration(cfg.ScalingPeriodSeconds) * time.Second
+		} else if cfg.ScalingPeriodSeconds < 0 {
+			scalingPeriod = 100 * time.Millisecond
+		}
+	}
+
 	c.SIStorage.Set(serviceInfo.Name, &ServiceInfoStorage{
 		ServiceInfo:             serviceInfo,
 		ControlPlane:            c,
-		Controller:              autoscaling.NewPerFunctionStateController(make(chan int), serviceInfo, 2*time.Second), // TODO: Hardcoded autoscaling for now
+		Controller:              autoscaling.NewPerFunctionStateController(make(chan int), serviceInfo, scalingPeriod),
 		ColdStartTracingChannel: c.ColdStartTracing.InputChannel,
 		PlacementPolicy:         c.PlacementPolicy,
 		PersistenceLayer:        c.PersistenceLayer,

@@ -31,18 +31,25 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/cio"
+	containerdcontainers "github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/oci"
+	containerdplugin "github.com/containerd/containerd/plugin"
+	runcoptions "github.com/containerd/containerd/runtime/v2/runc/options"
 	"github.com/containerd/go-cni"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 )
 
 const (
 	SIGKILL uint32 = 137
+
+	RuncV2ShimGroupAnnotation = "io.containerd.runc.v2.group"
 )
 
 func GetContainerdClient(containerdSocket string) *containerd.Client {
@@ -54,8 +61,19 @@ func GetContainerdClient(containerdSocket string) *containerd.Client {
 	return client
 }
 
-func GetCNIClient(configFile string) cni.CNI {
-	network, err := cni.New(cni.WithConfFile(configFile))
+func GetCNIClient(configFile string, pluginDirs ...string) cni.CNI {
+	opts := []cni.Opt{}
+	// Plugin dir must be set BEFORE loading config, because the config
+	// captures the cniConfig reference at load time.
+	if len(pluginDirs) > 0 && pluginDirs[0] != "" {
+		opts = append(opts, cni.WithPluginDir(pluginDirs))
+	}
+	if strings.HasSuffix(configFile, ".conflist") {
+		opts = append(opts, cni.WithConfListFile(configFile))
+	} else {
+		opts = append(opts, cni.WithConfFile(configFile))
+	}
+	network, err := cni.New(opts...)
 	if err != nil {
 		logrus.Fatal("Failed to create a CNI client - ", err)
 	}
@@ -64,6 +82,10 @@ func GetCNIClient(configFile string) cni.CNI {
 }
 
 func FetchImage(ctx context.Context, client *containerd.Client, imageURL string) (containerd.Image, error) {
+	// Try local image first (avoids pull for pre-imported images).
+	if img, err := client.GetImage(ctx, imageURL); err == nil {
+		return img, nil
+	}
 	image, err := client.Pull(ctx, imageURL, containerd.WithPullUnpack)
 	if err != nil {
 		return nil, err
@@ -88,6 +110,152 @@ func CreateContainer(ctx context.Context, client *containerd.Client, image conta
 	}
 
 	return container, nil, time.Since(start)
+}
+
+// CreateContainerInNetNS creates a container whose OCI spec joins a
+// pre-created network namespace (a PhantomK8s pool bundle netns with
+// eth0/IP/route already configured) instead of letting runc create a
+// fresh one. CNI is skipped entirely for such containers.
+func CreateContainerInNetNS(ctx context.Context, client *containerd.Client, image containerd.Image, netnsPath string) (containerd.Container, error, time.Duration) {
+	return CreateContainerInNetNSWithOptions(ctx, client, image, netnsPath, ContainerCreateOptions{})
+}
+
+type ContainerCreateOptions struct {
+	RuncV2ShimGroup string
+	RuntimeBinary   string
+	// RuneRuntime routes the container through the node-singleton rune shim
+	// (io.containerd.rune.v2). Its app-container fast path parks a ~0.5MB C
+	// fork-server child instead of a per-slot runc shim (5.5MB) + runc init
+	// (3.8MB): zero per-slot shim processes. Requires the image annotation
+	// below so the shim's template registry can resolve the rootfs lowerdir.
+	RuneRuntime bool
+}
+
+const (
+	runeRuntimeName    = "io.containerd.rune.v2"
+	criImageAnnotation = "io.kubernetes.cri.image-name"
+)
+
+func CreateContainerInNetNSWithOptions(ctx context.Context, client *containerd.Client, image containerd.Image, netnsPath string, opts ContainerCreateOptions) (containerd.Container, error, time.Duration) {
+	start := time.Now()
+
+	containerName := fmt.Sprintf("workload-%d", rand.Int())
+
+	specOpts := []oci.SpecOpts{
+		oci.WithImageConfig(image),
+		oci.WithLinuxNamespace(specs.LinuxNamespace{
+			Type: specs.NetworkNamespace,
+			Path: netnsPath,
+		}),
+	}
+	if opts.RuncV2ShimGroup != "" {
+		specOpts = append(specOpts, withSpecAnnotation(RuncV2ShimGroupAnnotation, opts.RuncV2ShimGroup))
+	}
+	if opts.RuneRuntime {
+		// The rune shim's Create reads the CRI image annotation to find its
+		// rootfs template (first create per image per node takes its cold
+		// path and registers the template; the rest park fork-server children).
+		specOpts = append(specOpts, withSpecAnnotation(criImageAnnotation, image.Name()))
+	}
+
+	containerOpts := []containerd.NewContainerOpts{
+		containerd.WithImage(image),
+		containerd.WithNewSnapshot(containerName, image),
+		containerd.WithNewSpec(specOpts...),
+	}
+	if opts.RuneRuntime {
+		containerOpts = append(containerOpts, containerd.WithRuntime(runeRuntimeName, nil))
+	} else if opts.RuntimeBinary != "" {
+		containerOpts = append(containerOpts, containerd.WithRuntime(containerdplugin.RuntimeRuncV2, &runcoptions.Options{
+			BinaryName: opts.RuntimeBinary,
+		}))
+	}
+
+	container, err := client.NewContainer(ctx, containerName, containerOpts...)
+
+	if err != nil {
+		return nil, err, time.Since(start)
+	}
+
+	return container, nil, time.Since(start)
+}
+
+func withSpecAnnotation(key, value string) oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containerdcontainers.Container, s *oci.Spec) error {
+		if s.Annotations == nil {
+			s.Annotations = map[string]string{}
+		}
+		s.Annotations[key] = value
+		return nil
+	}
+}
+
+type StartTimings struct {
+	NewTask   time.Duration
+	Wait      time.Duration
+	TaskStart time.Duration
+}
+
+// StartContainerPrenetworked starts a container whose network namespace was
+// joined at spec time (pool bundle) — no CNI setup on the hot path.
+func StartContainerPrenetworked(ctx context.Context, container containerd.Container) (containerd.Task, <-chan containerd.ExitStatus, error, time.Duration, StartTimings) {
+	start := time.Now()
+	var timings StartTimings
+
+	newTaskStart := time.Now()
+	task, err := container.NewTask(ctx, cio.NewCreator())
+	timings.NewTask = time.Since(newTaskStart)
+	if err != nil {
+		return nil, nil, err, time.Since(start), timings
+	}
+
+	waitStart := time.Now()
+	statusChannel, err := task.Wait(ctx)
+	timings.Wait = time.Since(waitStart)
+	if err != nil {
+		return nil, nil, err, time.Since(start), timings
+	}
+
+	taskStart := time.Now()
+	if err := task.Start(ctx); err != nil {
+		timings.TaskStart = time.Since(taskStart)
+		return nil, nil, err, time.Since(start), timings
+	}
+	timings.TaskStart = time.Since(taskStart)
+
+	return task, statusChannel, nil, time.Since(start), timings
+}
+
+// CreateParkedTask creates the task — shim spawn + runc create (clone init,
+// join namespaces, cgroup, pivot_root) — WITHOUT starting it. The container
+// init is parked before execve. This is the expensive, contention-prone half
+// of the launch; calling it at pool-fill time moves it off the hot path.
+func CreateParkedTask(ctx context.Context, container containerd.Container) (containerd.Task, error, time.Duration) {
+	start := time.Now()
+	task, err := container.NewTask(ctx, cio.NewCreator())
+	return task, err, time.Since(start)
+}
+
+// StartParkedTask runs Wait+Start on a pre-created (parked) task — the entire
+// hot-path containerd work for a precreated sandbox: unblock init -> execve.
+func StartParkedTask(ctx context.Context, task containerd.Task) (<-chan containerd.ExitStatus, error, StartTimings) {
+	var timings StartTimings
+
+	waitStart := time.Now()
+	statusChannel, err := task.Wait(ctx)
+	timings.Wait = time.Since(waitStart)
+	if err != nil {
+		return nil, err, timings
+	}
+
+	taskStart := time.Now()
+	err = task.Start(ctx)
+	timings.TaskStart = time.Since(taskStart)
+	if err != nil {
+		return nil, err, timings
+	}
+
+	return statusChannel, nil, timings
 }
 
 func StartContainer(ctx context.Context, container containerd.Container, network cni.CNI) (containerd.Task, <-chan containerd.ExitStatus, string, string, error, time.Duration, time.Duration) {
@@ -160,8 +328,13 @@ func DeleteContainer(ctx context.Context, network cni.CNI, metadata *managers.Me
 	containerMetadata := (*metadata).RuntimeMetadata.(ContainerdMetadata)
 
 	// TODO: what happens with CNI and container metadata if the container fails -- memory leak
-	if err := network.Remove(ctx, containerMetadata.Container.ID(), metadata.NetNs); err != nil {
-		return err
+	// NetNs == "" means the container joined a pre-created pool bundle netns:
+	// CNI never ran, so there is nothing to remove (the bundle is reclaimed
+	// by the worker after deletion).
+	if metadata.NetNs != "" {
+		if err := network.Remove(ctx, containerMetadata.Container.ID(), metadata.NetNs); err != nil {
+			return err
+		}
 	}
 
 	// non-graceful shutdown

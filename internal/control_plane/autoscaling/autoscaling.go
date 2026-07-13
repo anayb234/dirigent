@@ -202,8 +202,23 @@ func (s *AutoscalingMetadata) internalScaleAlgorithm(scalingMetric float64) (int
 }
 
 func (s *AutoscalingMetadata) windowAverage(observedStableValue float64) (float64, float64) {
-	panicBucketCount := int64(s.AutoscalingConfig.PanicWindowWidthSeconds / s.AutoscalingConfig.ScalingPeriodSeconds)
-	stableBucketCount := int64(s.AutoscalingConfig.StableWindowWidthSeconds / s.AutoscalingConfig.ScalingPeriodSeconds)
+	// ScalingPeriodSeconds <= 0 means a sub-second benchmark tick (see
+	// helpers.go); size the averaging windows as if the period were 1s.
+	// Upstream never guarded this division: 0 panics with div-by-zero and
+	// negative values produce a negative bucket count, which skips the
+	// append branch and indexes an empty slice.
+	period := s.AutoscalingConfig.ScalingPeriodSeconds
+	if period <= 0 {
+		period = 1
+	}
+	panicBucketCount := int64(s.AutoscalingConfig.PanicWindowWidthSeconds / period)
+	stableBucketCount := int64(s.AutoscalingConfig.StableWindowWidthSeconds / period)
+	if panicBucketCount < 1 {
+		panicBucketCount = 1
+	}
+	if stableBucketCount < 1 {
+		stableBucketCount = 1
+	}
 
 	var smoothingCoefficientStable, smoothingCoefficientPanic, multiplierStable, multiplierPanic float64
 
