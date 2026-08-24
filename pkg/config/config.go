@@ -80,6 +80,7 @@ type WorkerNodeConfig struct {
 	PrecreateShimGroup  string   `mapstructure:"precreateShimGroup"`
 	PrecreateRuntimeBin string   `mapstructure:"precreateRuntimeBin"`
 	SkipIptables        bool     `mapstructure:"skipIptables"` // PhantomK8s proxies to container IPs directly; upstream Dirigent needs hostPort DNAT
+	AdoptableSandboxes  bool     `mapstructure:"adoptableSandboxes"` // create sandboxes in the k8s.io containerd namespace with kubelet-attribution labels (PhantomK8s adoption coordinates); default off = "cm"
 
 	FirecrackerKernel           string `mapstructure:"firecrackerKernel"`
 	FirecrackerFileSystem       string `mapstructure:"firecrackerFileSystem"`

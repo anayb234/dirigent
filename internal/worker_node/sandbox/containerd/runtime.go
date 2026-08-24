@@ -57,6 +57,17 @@ type ContainerdRuntime struct {
 
 	precreateCreateOptions ContainerCreateOptions
 	skipIptables           bool // true for PhantomK8s (direct container-IP proxy); false restores upstream hostPort DNAT
+
+	// ctrdNamespace is the containerd namespace NEW sandboxes are created in
+	// ("cm" by default; "k8s.io" when adoptable is set). Deletion never uses
+	// this field — it uses the namespace recorded on the sandbox itself
+	// (ContainerdMetadata.CtrdNamespace / PrecreatedSandbox.Namespace), so a
+	// worker restarted with the flag flipped still deletes old sandboxes from
+	// the namespace they were created in.
+	ctrdNamespace string
+	// adoptable stamps new sandboxes with the CRI sandbox coordinate contract
+	// (kind=sandbox label, kubelet pod labels, io.kubernetes.cri.* annotations).
+	adoptable bool
 }
 
 type ContainerdMetadata struct {
@@ -64,6 +75,10 @@ type ContainerdMetadata struct {
 
 	Task      containerd.Task
 	Container containerd.Container
+
+	// CtrdNamespace is the containerd namespace this sandbox was created in.
+	// Empty (records predating this field) means NamespaceCM.
+	CtrdNamespace string
 }
 
 func NewContainerdRuntime(cpApi proto.CpiInterfaceClient, config config.WorkerNodeConfig, sandboxManager *managers.SandboxManager) *ContainerdRuntime {
@@ -91,6 +106,11 @@ func NewContainerdRuntime(cpApi proto.CpiInterfaceClient, config config.WorkerNo
 		}
 	}
 
+	ctrdNamespace := NamespaceCM
+	if config.AdoptableSandboxes {
+		ctrdNamespace = NamespaceK8s
+	}
+
 	return &ContainerdRuntime{
 		cpApi: cpApi,
 
@@ -102,19 +122,53 @@ func NewContainerdRuntime(cpApi proto.CpiInterfaceClient, config config.WorkerNo
 		SandboxManager: sandboxManager,
 		ProcessMonitor: managers.NewProcessMonitor(),
 		precreateCreateOptions: ContainerCreateOptions{
-			RuncV2ShimGroup: config.PrecreateShimGroup,
-			RuntimeBinary:   config.PrecreateRuntimeBin,
+			RuncV2ShimGroup:  config.PrecreateShimGroup,
+			RuntimeBinary:    config.PrecreateRuntimeBin,
+			AdoptableSandbox: config.AdoptableSandboxes,
 		},
-		skipIptables: config.SkipIptables,
+		skipIptables:  config.SkipIptables,
+		ctrdNamespace: ctrdNamespace,
+		adoptable:     config.AdoptableSandboxes,
 	}
 }
 
+// createNS returns the containerd namespace for NEW sandboxes.
+func (cr *ContainerdRuntime) createNS() string {
+	if cr.ctrdNamespace == "" {
+		return NamespaceCM
+	}
+	return cr.ctrdNamespace
+}
+
+// nsCtx binds ctx to the runtime's creation namespace. Creation paths only —
+// deletion paths must use the namespace recorded on the sandbox.
+func (cr *ContainerdRuntime) nsCtx(ctx context.Context) context.Context {
+	return namespaces.WithNamespace(ctx, cr.createNS())
+}
+
+// recordedNS resolves the containerd namespace a sandbox record was created
+// in, defaulting to NamespaceCM for records that predate namespace tracking.
+func recordedNS(ns string) string {
+	if ns == "" {
+		return NamespaceCM
+	}
+	return ns
+}
+
 func (cr *ContainerdRuntime) CreateSandbox(grpcCtx context.Context, in *proto.ServiceInfo) (*proto.SandboxCreationStatus, error) {
+	return cr.CreateSandboxWithIdentity(grpcCtx, in, nil)
+}
+
+// CreateSandboxWithIdentity is CreateSandbox with optional kubelet pod
+// attribution: when the runtime is in adoptable mode, the container is created
+// in k8s.io with the CRI sandbox coordinate contract, and identity (if
+// non-nil) binds it to an API pod. identity is ignored outside adoptable mode.
+func (cr *ContainerdRuntime) CreateSandboxWithIdentity(grpcCtx context.Context, in *proto.ServiceInfo, identity *PodIdentity) (*proto.SandboxCreationStatus, error) {
 	logrus.Debug("Create sandbox for service = '", in.Name, "'")
 
 	start := time.Now()
 
-	ctx := namespaces.WithNamespace(grpcCtx, "cm")
+	ctx := cr.nsCtx(grpcCtx)
 	image, err, durationFetch := cr.ImageManager.GetImage(ctx, cr.ContainerdClient, in.Image)
 
 	if err != nil {
@@ -122,7 +176,10 @@ func (cr *ContainerdRuntime) CreateSandbox(grpcCtx context.Context, in *proto.Se
 		return &proto.SandboxCreationStatus{Success: false}, err
 	}
 
-	container, err, durationContainerCreation := CreateContainer(ctx, cr.ContainerdClient, image)
+	container, err, durationContainerCreation := CreateContainerWithOptions(ctx, cr.ContainerdClient, image, ContainerCreateOptions{
+		AdoptableSandbox: cr.adoptable,
+		Identity:         identity,
+	})
 	if err != nil {
 		logrus.Warn("Failed creating a container - ", err)
 		return &proto.SandboxCreationStatus{Success: false}, err
@@ -139,8 +196,9 @@ func (cr *ContainerdRuntime) CreateSandbox(grpcCtx context.Context, in *proto.Se
 		ServiceName: in.Name,
 
 		RuntimeMetadata: ContainerdMetadata{
-			Task:      task,
-			Container: container,
+			Task:          task,
+			Container:     container,
+			CtrdNamespace: cr.createNS(),
 		},
 
 		HostPort:  AssignRandomPort(),
@@ -200,12 +258,13 @@ func (cr *ContainerdRuntime) CreateSandbox(grpcCtx context.Context, in *proto.Se
 // PhantomK8s pool bundle netns (eth0/IP/route preconfigured). CNI is skipped
 // entirely; the pod IP is the bundle's pre-assigned IP. Metadata.NetNs is left
 // empty so DeleteContainer skips CNI removal — the caller reclaims the bundle.
-func (cr *ContainerdRuntime) CreateSandboxInBundle(grpcCtx context.Context, in *proto.ServiceInfo, netnsPath, ip string) (*proto.SandboxCreationStatus, error) {
+// identity (optional, adoptable mode only) attributes the sandbox to an API pod.
+func (cr *ContainerdRuntime) CreateSandboxInBundle(grpcCtx context.Context, in *proto.ServiceInfo, netnsPath, ip string, identity *PodIdentity) (*proto.SandboxCreationStatus, error) {
 	logrus.Debug("Create sandbox (bundle netns) for service = '", in.Name, "'")
 
 	start := time.Now()
 
-	ctx := namespaces.WithNamespace(grpcCtx, "cm")
+	ctx := cr.nsCtx(grpcCtx)
 	image, err, durationFetch := cr.ImageManager.GetImage(ctx, cr.ContainerdClient, in.Image)
 
 	if err != nil {
@@ -213,7 +272,10 @@ func (cr *ContainerdRuntime) CreateSandboxInBundle(grpcCtx context.Context, in *
 		return &proto.SandboxCreationStatus{Success: false}, err
 	}
 
-	container, err, durationContainerCreation := CreateContainerInNetNS(ctx, cr.ContainerdClient, image, netnsPath)
+	container, err, durationContainerCreation := CreateContainerInNetNSWithOptions(ctx, cr.ContainerdClient, image, netnsPath, ContainerCreateOptions{
+		AdoptableSandbox: cr.adoptable,
+		Identity:         identity,
+	})
 	if err != nil {
 		logrus.Warn("Failed creating a container - ", err)
 		return &proto.SandboxCreationStatus{Success: false}, err
@@ -231,8 +293,9 @@ func (cr *ContainerdRuntime) CreateSandboxInBundle(grpcCtx context.Context, in *
 		ServiceName: in.Name,
 
 		RuntimeMetadata: ContainerdMetadata{
-			Task:      task,
-			Container: container,
+			Task:          task,
+			Container:     container,
+			CtrdNamespace: cr.createNS(),
 		},
 
 		HostPort:  AssignRandomPort(),
@@ -285,6 +348,11 @@ type PrecreatedSandbox struct {
 	Image     string
 	NewTaskMs float64 // fill-time cost, for reporting
 	CreateMs  float64
+
+	// Namespace is the containerd namespace this slot was created in. Start/
+	// discard use it (never the current flag value), so slots parked before a
+	// config change are still torn down in the right namespace. Empty = "cm".
+	Namespace string
 }
 
 // PrecreateSandboxInBundle pays image-lookup + NewContainer(+snapshot) +
@@ -301,13 +369,16 @@ type PrecreatedSandbox struct {
 //   "native": NewContainer + NewTask via the node-singleton rune shim — the
 //     parked init is a ~0.5MB C fork-server child; zero per-slot shims.
 func (cr *ContainerdRuntime) PrecreateSandboxInBundle(grpcCtx context.Context, imageName, netnsPath, ip, stage string) (*PrecreatedSandbox, error) {
-	ctx := namespaces.WithNamespace(grpcCtx, "cm")
+	ctx := cr.nsCtx(grpcCtx)
 
 	image, err, _ := cr.ImageManager.GetImage(ctx, cr.ContainerdClient, imageName)
 	if err != nil {
 		return nil, err
 	}
 
+	// Adoptable slots are parked before any pod identity exists: they carry
+	// the sandbox-kind shape now; the pod labels are bound at claim time
+	// (ApplyPodIdentityLabels in StartPrecreatedSandbox).
 	createOpts := cr.precreateCreateOptions
 	if stage == "native" {
 		createOpts.RuneRuntime = true
@@ -322,6 +393,7 @@ func (cr *ContainerdRuntime) PrecreateSandboxInBundle(grpcCtx context.Context, i
 		IP:        ip,
 		Image:     imageName,
 		CreateMs:  float64(durationCreate.Nanoseconds()) / 1e6,
+		Namespace: cr.createNS(),
 	}
 	if stage == "container" {
 		return pre, nil
@@ -341,9 +413,20 @@ func (cr *ContainerdRuntime) PrecreateSandboxInBundle(grpcCtx context.Context, i
 // StartPrecreatedSandbox is the hot path for a precreated sandbox: Wait+Start
 // (unblock parked init -> execve) plus monitoring registration. SandboxCreate
 // is reported as 0 — that cost was paid at precreate time.
-func (cr *ContainerdRuntime) StartPrecreatedSandbox(grpcCtx context.Context, in *proto.ServiceInfo, pre *PrecreatedSandbox) (*proto.SandboxCreationStatus, error) {
+// identity (optional, adoptable mode only) binds the claimed slot to its API
+// pod by merging the kubelet-attribution labels onto the container.
+func (cr *ContainerdRuntime) StartPrecreatedSandbox(grpcCtx context.Context, in *proto.ServiceInfo, pre *PrecreatedSandbox, identity *PodIdentity) (*proto.SandboxCreationStatus, error) {
 	start := time.Now()
-	ctx := namespaces.WithNamespace(grpcCtx, "cm")
+	ctx := namespaces.WithNamespace(grpcCtx, recordedNS(pre.Namespace))
+
+	// Bind the pod identity to this slot (labels are mutable; the container
+	// was parked before the pod was known). Fail open: a failed label write
+	// only loses attribution for this invocation, not the launch itself.
+	if cr.adoptable && identity != nil {
+		if err := ApplyPodIdentityLabels(ctx, pre.Container, identity); err != nil {
+			logrus.Warnf("Failed to bind pod identity %s to precreated sandbox %s: %v", identity.UID, pre.Container.ID(), err)
+		}
+	}
 
 	// Tier-2 (container-only park): no shim/init held — pay NewTask at claim.
 	claimNewTask := time.Duration(0)
@@ -370,8 +453,9 @@ func (cr *ContainerdRuntime) StartPrecreatedSandbox(grpcCtx context.Context, in 
 		ServiceName: in.Name,
 
 		RuntimeMetadata: ContainerdMetadata{
-			Task:      pre.Task,
-			Container: pre.Container,
+			Task:          pre.Task,
+			Container:     pre.Container,
+			CtrdNamespace: recordedNS(pre.Namespace),
 		},
 
 		HostPort:  AssignRandomPort(),
@@ -415,7 +499,8 @@ func (cr *ContainerdRuntime) StartPrecreatedSandbox(grpcCtx context.Context, in 
 // sandbox: kill+delete the task (if one was created), delete the container
 // and its snapshot.
 func (cr *ContainerdRuntime) DiscardPrecreatedSandbox(grpcCtx context.Context, pre *PrecreatedSandbox) error {
-	ctx := namespaces.WithNamespace(grpcCtx, "cm")
+	// Use the namespace the slot was CREATED in, never the current flag value.
+	ctx := namespaces.WithNamespace(grpcCtx, recordedNS(pre.Namespace))
 	if pre.Task != nil {
 		if _, err := pre.Task.Delete(ctx, containerd.WithProcessKill); err != nil {
 			logrus.Warn("discard precreated task: ", err)
@@ -436,13 +521,22 @@ func (cr *ContainerdRuntime) ConsumeStartTimings(sandboxID string) (StartTimings
 func (cr *ContainerdRuntime) DeleteSandbox(grpcCtx context.Context, in *proto.SandboxID) (*proto.ActionStatus, error) {
 	logrus.Debug("RemoveKey sandbox with ID = '", in.ID, "'")
 
-	ctx := namespaces.WithNamespace(grpcCtx, "cm")
 	metadata := cr.SandboxManager.DeleteSandbox(in.ID)
 
 	if metadata == nil {
 		logrus.Warn("Tried to delete non-existing sandbox ", in.ID)
 		return &proto.ActionStatus{Success: false}, nil
 	}
+
+	// Delete from the namespace the sandbox was CREATED in (recorded on its
+	// metadata), never from the namespace the current flags would pick — a
+	// worker whose --adoptable-sandboxes flag changed across a restart must
+	// not orphan sandboxes in the other namespace.
+	deleteNS := NamespaceCM
+	if cm, ok := metadata.RuntimeMetadata.(ContainerdMetadata); ok {
+		deleteNS = recordedNS(cm.CtrdNamespace)
+	}
+	ctx := namespaces.WithNamespace(grpcCtx, deleteNS)
 
 	start := time.Now()
 

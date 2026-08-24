@@ -51,6 +51,8 @@ var (
 	precreateShimGroup  = flag.String("precreate-shim-group", "", "runc-v2 shim group ID for parked precreated tasks; empty disables shim grouping")
 	precreateRuntimeBin = flag.String("precreate-runtime-binary", "", "OCI runtime binary for parked precreated tasks, e.g. crun; empty uses containerd default runc")
 
+	adoptableSandboxes = flag.Bool("adoptable-sandboxes", false, "create sandboxes in the k8s.io containerd namespace (instead of cm) with kubelet-attribution labels (io.kubernetes.pod.{uid,name,namespace}, io.cri-containerd.kind=sandbox) and CRI sandbox annotations, so materialized sandboxes sit at the coordinates the kubelet's runtime looks at. Requires images to be present/pullable in the k8s.io namespace (e.g. ctr -n k8s.io images import). See cmd/phantomk8s_worker/ADOPTION.md for what this does and does not buy.")
+
 	brokerPoolSize = flag.Int("broker-pool", 0, "N C launch-broker lanes; when >0, /sandbox/create launches the function via a broker (fork+setns+cgroup+exec) instead of containerd, bypassing the shim ForkLock. Requires --pool-agent and --broker-exec.")
 	brokerExec     = flag.String("broker-exec", "", "host path to the function executable launched by brokers (broker arm only)")
 	brokerPool     *BrokerPool
@@ -78,14 +80,24 @@ func releaseAdmission(sandboxID string) {
 
 // brokerProc tracks a broker-launched process for teardown/reclaim.
 type brokerProc struct {
-	pid      int
-	bundleID int
+	pid         int
+	bundleID    int
+	bundleLease uint64
 }
 
 var brokerProcs sync.Map // sandbox ID ("broker-<pid>") -> brokerProc
 
-// sandboxBundles maps containerID -> pool bundle ID so handleDelete can
-// reclaim the bundle after the sandbox is torn down.
+// sandboxBundle pairs a pool bundle ID with the lease under which it was
+// acquired, so reclaims are fenced (a stale reclaim after the bundle was
+// re-leased is an idempotent no-op on the pool side). The lease travels with
+// the sandbox record, like the containerd namespace does.
+type sandboxBundle struct {
+	id    int
+	lease uint64
+}
+
+// sandboxBundles maps containerID -> sandboxBundle so handleDelete can
+// reclaim the bundle (fenced by its lease) after the sandbox is torn down.
 var sandboxBundles sync.Map
 
 // poolClient is used for node-local pool agent acquire/reclaim calls.
@@ -97,6 +109,7 @@ type poolBundle struct {
 	NetNSPath  string `json:"netns_path"`
 	CgroupPath string `json:"cgroup_path"`
 	IP         string `json:"ip"`
+	LeaseID    uint64 `json:"lease_id"` // reclaim fence; 0 = pool without lease fencing
 }
 
 func acquireBundle(agentURL string) (*poolBundle, error) {
@@ -115,14 +128,22 @@ func acquireBundle(agentURL string) (*poolBundle, error) {
 	if b.NetNSPath == "" || b.IP == "" {
 		// Bundle has no usable netns (agent likely running with --skip-netns).
 		// Return it immediately so it isn't leaked.
-		reclaimBundle(agentURL, b.BundleID)
+		reclaimBundle(agentURL, b.BundleID, b.LeaseID)
 		return nil, fmt.Errorf("pool acquire: bundle %d has no netns/IP (agent running with --skip-netns?)", b.BundleID)
 	}
 	return &b, nil
 }
 
-func reclaimBundle(agentURL string, bundleID int) {
-	resp, err := poolClient.Post(fmt.Sprintf("%s/reclaim?id=%d", agentURL, bundleID), "application/json", nil)
+// reclaimBundle returns a bundle to the pool. leaseID (from the /acquire
+// response) fences the reclaim: the pool ignores it if the bundle has since
+// been re-leased (ABA protection). 0 falls back to an unfenced reclaim for
+// pools that predate lease fencing.
+func reclaimBundle(agentURL string, bundleID int, leaseID uint64) {
+	url := fmt.Sprintf("%s/reclaim?id=%d", agentURL, bundleID)
+	if leaseID != 0 {
+		url = fmt.Sprintf("%s&lease_id=%d", url, leaseID)
+	}
+	resp, err := poolClient.Post(url, "application/json", nil)
 	if err != nil {
 		log.Printf("[worker] bundle %d reclaim failed: %v", bundleID, err)
 		return
@@ -141,6 +162,12 @@ type CreateRequest struct {
 	PodUID      string `json:"pod_uid,omitempty"`      // API-server pod UID; with --cgroup-driver, the parked PID migrates into kubepods/pod<uid> before start
 	CPULimit    string `json:"cpu_limit,omitempty"`    // phantom cpu limit (e.g. "500m") → cpu.max on the adopted pod cgroup
 	CPURequest  string `json:"cpu_request,omitempty"`  // phantom cpu request → cpu.weight on the adopted pod cgroup
+
+	// Pod identity for --adoptable-sandboxes: with PodUID they become the
+	// io.kubernetes.pod.{uid,name,namespace} labels on the sandbox container.
+	// PodName falls back to Name; PodNamespace falls back to "default".
+	PodName      string `json:"pod_name,omitempty"`
+	PodNamespace string `json:"pod_namespace,omitempty"`
 }
 
 // CreateResponse is returned from POST /sandbox/create.
@@ -181,6 +208,7 @@ type PrecreateRequest struct {
 type precreatedEntry struct {
 	pre         *ctrd.PrecreatedSandbox
 	bundleID    int
+	bundleLease uint64 // lease under which the bundle was acquired (reclaim fence)
 	bundleOwned bool
 }
 
@@ -231,6 +259,7 @@ func main() {
 		PrecreateShimGroup:  *precreateShimGroup,
 		PrecreateRuntimeBin: *precreateRuntimeBin,
 		SkipIptables:        true, // gateway proxies to container IPs directly
+		AdoptableSandboxes:  *adoptableSandboxes,
 	}
 
 	sandboxManager := managers.NewSandboxManager(fmt.Sprintf("phantomk8s-%d", os.Getpid()))
@@ -270,9 +299,18 @@ func main() {
 		log.Printf("[worker] broker pool: %d lanes, exec=%q", bp.Size(), *brokerExec)
 	}
 
-	// Pre-pull images if requested (use "cm" namespace to match runtime).
+	// The containerd namespace sandboxes are created in. "cm" by default;
+	// "k8s.io" in adoptable mode (deletes always follow the namespace recorded
+	// on the sandbox, so flipping the flag across restarts cannot orphan).
+	workerNS := ctrd.NamespaceCM
+	if *adoptableSandboxes {
+		workerNS = ctrd.NamespaceK8s
+		log.Printf("[worker] adoptable sandboxes: creating in containerd namespace %q with kubelet-attribution labels (images must be importable/pullable in this namespace)", workerNS)
+	}
+
+	// Pre-pull images if requested (same namespace as the runtime).
 	if *prefetch {
-		ctx := namespaces.WithNamespace(context.Background(), "cm")
+		ctx := namespaces.WithNamespace(context.Background(), workerNS)
 		log.Println("[worker] prefetching images...")
 		ctrd.FetchImage(ctx, runtime.ContainerdClient, "docker.io/cvetkovic/dirigent_trace_function:latest")
 	}
@@ -352,6 +390,26 @@ func handleCreate(runtime *ctrd.ContainerdRuntime) http.HandlerFunc {
 			},
 		}
 
+		// Pod identity for adoptable sandboxes: the kubelet-attribution
+		// coordinates stamped onto the container. Only meaningful with
+		// --adoptable-sandboxes and a pod UID (phantoms are real API pods,
+		// so the gateway always has one).
+		var identity *ctrd.PodIdentity
+		if *adoptableSandboxes && req.PodUID != "" {
+			podName := req.PodName
+			if podName == "" {
+				podName = req.Name // gateway sends the phantom pod name as Name
+			}
+			podNamespace := req.PodNamespace
+			if podNamespace == "" {
+				podNamespace = "default"
+			}
+			if req.PodName == "" || req.PodNamespace == "" {
+				log.Printf("[worker] adoptable create for pod %s: pod_name/pod_namespace not supplied, using fallbacks %q/%q", req.PodUID, podName, podNamespace)
+			}
+			identity = &ctrd.PodIdentity{UID: req.PodUID, Name: podName, Namespace: podNamespace}
+		}
+
 		// --- Broker arm ---
 		// When a broker pool is configured, the function is launched by a C
 		// broker (fork+setns+cgroup+exec) directly into a pool bundle, bypassing
@@ -368,6 +426,7 @@ func handleCreate(runtime *ctrd.ContainerdRuntime) http.HandlerFunc {
 		netnsPath := req.NetNS
 		bundleIP := req.IP
 		bundleID := 0
+		bundleLease := uint64(0)
 		bundleOwned := false
 		acquireMs := 0.0
 		var precreated *precreatedEntry
@@ -375,6 +434,7 @@ func handleCreate(runtime *ctrd.ContainerdRuntime) http.HandlerFunc {
 			path = "precreated"
 			precreated = e
 			bundleID = e.bundleID
+			bundleLease = e.bundleLease
 			bundleOwned = e.bundleOwned
 		} else if netnsPath != "" && bundleIP != "" {
 			path = "bundle"
@@ -391,6 +451,7 @@ func handleCreate(runtime *ctrd.ContainerdRuntime) http.HandlerFunc {
 				netnsPath = b.NetNSPath
 				bundleIP = b.IP
 				bundleID = b.BundleID
+				bundleLease = b.LeaseID
 				bundleOwned = true
 			}
 		}
@@ -429,14 +490,14 @@ func handleCreate(runtime *ctrd.ContainerdRuntime) http.HandlerFunc {
 					podCG = cg
 				}
 			}
-			result, err = runtime.StartPrecreatedSandbox(r.Context(), serviceInfo, precreated.pre)
+			result, err = runtime.StartPrecreatedSandbox(r.Context(), serviceInfo, precreated.pre, identity)
 			if err != nil || result == nil || !result.Success {
 				// Parked task failed to start — tear it down and free the bundle
 				// (and the adopted pod cgroup, once the killed PID drains out).
 				go func(e *precreatedEntry, cg string) {
 					_ = runtime.DiscardPrecreatedSandbox(context.Background(), e.pre)
 					if *poolAgent != "" && e.bundleOwned {
-						reclaimBundle(*poolAgent, e.bundleID)
+						reclaimBundle(*poolAgent, e.bundleID, e.bundleLease)
 					}
 					if cg != "" {
 						removePodCgroupPath(cg)
@@ -444,13 +505,13 @@ func handleCreate(runtime *ctrd.ContainerdRuntime) http.HandlerFunc {
 				}(precreated, podCG)
 			}
 		case "bundle":
-			result, err = runtime.CreateSandboxInBundle(r.Context(), serviceInfo, netnsPath, bundleIP)
+			result, err = runtime.CreateSandboxInBundle(r.Context(), serviceInfo, netnsPath, bundleIP, identity)
 			if (err != nil || result == nil || !result.Success) && bundleOwned {
 				// Launch failed — return the bundle so it isn't leaked.
-				go reclaimBundle(*poolAgent, bundleID)
+				go reclaimBundle(*poolAgent, bundleID, bundleLease)
 			}
 		default:
-			result, err = runtime.CreateSandbox(r.Context(), serviceInfo)
+			result, err = runtime.CreateSandboxWithIdentity(r.Context(), serviceInfo, identity)
 		}
 		tContainerdDone := time.Now()
 		totalMs := float64(tContainerdDone.Sub(tReceived).Nanoseconds()) / 1e6
@@ -489,6 +550,12 @@ func handleCreate(runtime *ctrd.ContainerdRuntime) http.HandlerFunc {
 		breakdown["containerd_ms"] = fmt.Sprintf("%.1f", containerdMs)
 		breakdown["received_unix_us"] = fmt.Sprintf("%d", receivedUnixUs)
 		breakdown["path"] = path
+		if *adoptableSandboxes {
+			breakdown["ctrd_ns"] = ctrd.NamespaceK8s
+			if identity != nil {
+				breakdown["adoptable_pod_uid"] = identity.UID
+			}
+		}
 		if path == "bundle" {
 			breakdown["bundle_acquire_ms"] = fmt.Sprintf("%.3f", acquireMs)
 			breakdown["bundle_id"] = fmt.Sprintf("%d", bundleID)
@@ -518,9 +585,10 @@ func handleCreate(runtime *ctrd.ContainerdRuntime) http.HandlerFunc {
 			ip = meta.IP
 		}
 
-		// Remember which bundle backs this sandbox so delete can reclaim it.
+		// Remember which bundle (and lease) backs this sandbox so delete can
+		// reclaim it with the correct fence.
 		if (path == "bundle" || path == "precreated") && bundleOwned {
-			sandboxBundles.Store(result.ID, bundleID)
+			sandboxBundles.Store(result.ID, sandboxBundle{id: bundleID, lease: bundleLease})
 		}
 		// Hold the admission reservation until this sandbox is deleted.
 		if gate != nil && admDelta > 0 {
@@ -576,13 +644,13 @@ func handleBrokerCreate(w http.ResponseWriter, tReceived time.Time, receivedUnix
 	launchMs := float64(time.Since(tLaunch).Nanoseconds()) / 1e6
 	if lerr != nil {
 		gate.releaseIf(admDelta)
-		reclaimBundle(*poolAgent, b.BundleID)
+		reclaimBundle(*poolAgent, b.BundleID, b.LeaseID)
 		jsonError(w, "broker launch: "+lerr.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	sandboxID := fmt.Sprintf("broker-%d", pid)
-	brokerProcs.Store(sandboxID, brokerProc{pid: pid, bundleID: b.BundleID})
+	brokerProcs.Store(sandboxID, brokerProc{pid: pid, bundleID: b.BundleID, bundleLease: b.LeaseID})
 	if gate != nil && admDelta > 0 {
 		admissionDeltas.Store(sandboxID, admDelta)
 	}
@@ -658,13 +726,13 @@ func handlePrecreate(runtime *ctrd.ContainerdRuntime) http.HandlerFunc {
 			}
 			pre, err := runtime.PrecreateSandboxInBundle(r.Context(), req.Image, b.NetNSPath, b.IP, req.Stage)
 			if err != nil {
-				reclaimBundle(*poolAgent, b.BundleID)
+				reclaimBundle(*poolAgent, b.BundleID, b.LeaseID)
 				if firstErr == "" {
 					firstErr = err.Error()
 				}
 				break
 			}
-			pushPrecreated(req.Image, &precreatedEntry{pre: pre, bundleID: b.BundleID, bundleOwned: true})
+			pushPrecreated(req.Image, &precreatedEntry{pre: pre, bundleID: b.BundleID, bundleLease: b.LeaseID, bundleOwned: true})
 			created++
 		}
 		fillMs := float64(time.Since(t0).Nanoseconds()) / 1e6
@@ -695,7 +763,7 @@ func handleDrain(runtime *ctrd.ContainerdRuntime) http.HandlerFunc {
 					log.Printf("[worker] drain discard: %v", err)
 				}
 				if *poolAgent != "" && e.bundleOwned {
-					reclaimBundle(*poolAgent, e.bundleID)
+					reclaimBundle(*poolAgent, e.bundleID, e.bundleLease)
 				}
 				drained++
 			}
@@ -766,7 +834,7 @@ func handleDelete(runtime *ctrd.ContainerdRuntime) http.HandlerFunc {
 				_ = brokerPool.Kill(bp.bundleID, bp.pid, 9)
 			}
 			if *poolAgent != "" {
-				go reclaimBundle(*poolAgent, bp.bundleID)
+				go reclaimBundle(*poolAgent, bp.bundleID, bp.bundleLease)
 			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
@@ -782,10 +850,11 @@ func handleDelete(runtime *ctrd.ContainerdRuntime) http.HandlerFunc {
 			return
 		}
 
-		// If this sandbox was backed by a pool bundle, return it to the pool.
+		// If this sandbox was backed by a pool bundle, return it to the pool
+		// (fenced by the lease it was acquired under).
 		if raw, ok := sandboxBundles.LoadAndDelete(req.ID); ok && *poolAgent != "" {
-			if bundleID, ok := raw.(int); ok {
-				go reclaimBundle(*poolAgent, bundleID)
+			if b, ok := raw.(sandboxBundle); ok {
+				go reclaimBundle(*poolAgent, b.id, b.lease)
 			}
 		}
 

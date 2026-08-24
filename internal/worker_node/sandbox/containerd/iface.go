@@ -52,6 +52,115 @@ const (
 	RuncV2ShimGroupAnnotation = "io.containerd.runc.v2.group"
 )
 
+// Containerd namespaces sandboxes are created in. Upstream Dirigent (and the
+// PhantomK8s default) uses "cm", which the kubelet never watches. Adoptable
+// mode (--adoptable-sandboxes) uses the CRI plugin's "k8s.io" so materialized
+// sandboxes live at the coordinates the kubelet's runtime would look at.
+const (
+	NamespaceCM  = "cm"
+	NamespaceK8s = "k8s.io"
+)
+
+// CRI coordinate-contract label/annotation conventions. Values mirror
+// containerd pkg/cri/server/helpers.go + pkg/cri/annotations (verified against
+// the vendored v1.5.17) and k8s.io/kubernetes pkg/kubelet/types labels. They
+// are declared locally to avoid importing the CRI plugin packages.
+const (
+	// Container label the CRI plugin filters on in recover() at containerd
+	// restart (restart.go): kind=sandbox marks a sandbox container.
+	criKindLabel   = "io.cri-containerd.kind"
+	criKindSandbox = "sandbox"
+
+	// Kubelet pod-attribution labels stamped by the kubelet onto every CRI
+	// sandbox/container it creates.
+	podUIDLabel       = "io.kubernetes.pod.uid"
+	podNameLabel      = "io.kubernetes.pod.name"
+	podNamespaceLabel = "io.kubernetes.pod.namespace"
+
+	// CRI OCI-spec annotations (visible to shims/NRI, immutable after create).
+	criContainerTypeAnnotation    = "io.kubernetes.cri.container-type"
+	criContainerTypeSandbox       = "sandbox"
+	criSandboxIDAnnotation        = "io.kubernetes.cri.sandbox-id"
+	criSandboxNameAnnotation      = "io.kubernetes.cri.sandbox-name"
+	criSandboxNamespaceAnnotation = "io.kubernetes.cri.sandbox-namespace"
+	criSandboxUIDAnnotation       = "io.kubernetes.cri.sandbox-uid" // containerd >= 1.6 convention
+)
+
+// PodIdentity is the kubelet-attribution coordinate set for an adoptable
+// sandbox: the API-server pod this sandbox materializes. Namespace is the K8s
+// namespace of the pod, NOT a containerd namespace.
+type PodIdentity struct {
+	UID       string
+	Name      string
+	Namespace string
+}
+
+// adoptableLabels builds the containerd container labels that mark this
+// container as a CRI-shaped sandbox attributed to a pod. Identity may be nil
+// (precreated slots are filled before the pod is known; identity labels are
+// merged at claim via ApplyPodIdentityLabels).
+func adoptableLabels(id *PodIdentity) map[string]string {
+	labels := map[string]string{criKindLabel: criKindSandbox}
+	mergePodIdentityLabels(labels, id)
+	return labels
+}
+
+func mergePodIdentityLabels(labels map[string]string, id *PodIdentity) {
+	if id == nil {
+		return
+	}
+	if id.UID != "" {
+		labels[podUIDLabel] = id.UID
+	}
+	if id.Name != "" {
+		labels[podNameLabel] = id.Name
+	}
+	if id.Namespace != "" {
+		labels[podNamespaceLabel] = id.Namespace
+	}
+}
+
+// adoptableAnnotationSpecOpts returns the CRI-shaped OCI spec annotations for
+// a sandbox container. Our sandboxes are single-container (the workload IS the
+// sandbox), so sandbox-id is the container's own ID.
+func adoptableAnnotationSpecOpts(containerName string, id *PodIdentity) []oci.SpecOpts {
+	out := []oci.SpecOpts{
+		withSpecAnnotation(criContainerTypeAnnotation, criContainerTypeSandbox),
+		withSpecAnnotation(criSandboxIDAnnotation, containerName),
+	}
+	if id != nil {
+		if id.UID != "" {
+			out = append(out, withSpecAnnotation(criSandboxUIDAnnotation, id.UID))
+		}
+		if id.Name != "" {
+			out = append(out, withSpecAnnotation(criSandboxNameAnnotation, id.Name))
+		}
+		if id.Namespace != "" {
+			out = append(out, withSpecAnnotation(criSandboxNamespaceAnnotation, id.Namespace))
+		}
+	}
+	return out
+}
+
+// ApplyPodIdentityLabels merges the pod-attribution labels into an existing
+// container at claim time. Precreated (parked) slots are created before any
+// pod identity exists; when one is claimed for a pod, this binds the identity.
+// Containerd labels are mutable (SetLabels merges); the OCI sandbox-uid/name/
+// namespace annotations are not, so on precreated slots those stay absent —
+// the labels are the canonical coordinates.
+func ApplyPodIdentityLabels(ctx context.Context, container containerd.Container, id *PodIdentity) error {
+	if id == nil {
+		return nil
+	}
+	labels := map[string]string{}
+	mergePodIdentityLabels(labels, id)
+	if len(labels) == 0 {
+		return nil
+	}
+	_, err := container.SetLabels(ctx, labels)
+	return err
+}
+
 func GetContainerdClient(containerdSocket string) *containerd.Client {
 	client, err := containerd.New(containerdSocket)
 	if err != nil {
@@ -95,15 +204,31 @@ func FetchImage(ctx context.Context, client *containerd.Client, imageURL string)
 }
 
 func CreateContainer(ctx context.Context, client *containerd.Client, image containerd.Image) (containerd.Container, error, time.Duration) {
+	return CreateContainerWithOptions(ctx, client, image, ContainerCreateOptions{})
+}
+
+// CreateContainerWithOptions is CreateContainer (fresh netns, CNI to follow)
+// plus the adoptable-sandbox shape when opts request it.
+func CreateContainerWithOptions(ctx context.Context, client *containerd.Client, image containerd.Image, opts ContainerCreateOptions) (containerd.Container, error, time.Duration) {
 	start := time.Now()
 
 	containerName := fmt.Sprintf("workload-%d", rand.Int())
 
-	container, err := client.NewContainer(ctx, containerName,
+	specOpts := []oci.SpecOpts{oci.WithImageConfig(image)}
+	if opts.AdoptableSandbox {
+		specOpts = append(specOpts, adoptableAnnotationSpecOpts(containerName, opts.Identity)...)
+	}
+
+	containerOpts := []containerd.NewContainerOpts{
 		containerd.WithImage(image),
 		containerd.WithNewSnapshot(containerName, image),
-		containerd.WithNewSpec(oci.WithImageConfig(image)),
-	)
+		containerd.WithNewSpec(specOpts...),
+	}
+	if opts.AdoptableSandbox {
+		containerOpts = append(containerOpts, containerd.WithContainerLabels(adoptableLabels(opts.Identity)))
+	}
+
+	container, err := client.NewContainer(ctx, containerName, containerOpts...)
 
 	if err != nil {
 		return nil, err, time.Since(start)
@@ -129,6 +254,17 @@ type ContainerCreateOptions struct {
 	// (3.8MB): zero per-slot shim processes. Requires the image annotation
 	// below so the shim's template registry can resolve the rootfs lowerdir.
 	RuneRuntime bool
+
+	// AdoptableSandbox stamps the container with the CRI sandbox-container
+	// coordinate contract: containerd label io.cri-containerd.kind=sandbox +
+	// kubelet pod-attribution labels (from Identity, when known) and the
+	// io.kubernetes.cri.* sandbox annotations on the OCI spec. Pair with
+	// creating in the k8s.io containerd namespace (ContainerdRuntime does this
+	// when config.AdoptableSandboxes is set).
+	AdoptableSandbox bool
+	// Identity attributes the sandbox to an API pod. May be nil (precreated
+	// slots bind identity later via ApplyPodIdentityLabels).
+	Identity *PodIdentity
 }
 
 const (
@@ -157,11 +293,17 @@ func CreateContainerInNetNSWithOptions(ctx context.Context, client *containerd.C
 		// path and registers the template; the rest park fork-server children).
 		specOpts = append(specOpts, withSpecAnnotation(criImageAnnotation, image.Name()))
 	}
+	if opts.AdoptableSandbox {
+		specOpts = append(specOpts, adoptableAnnotationSpecOpts(containerName, opts.Identity)...)
+	}
 
 	containerOpts := []containerd.NewContainerOpts{
 		containerd.WithImage(image),
 		containerd.WithNewSnapshot(containerName, image),
 		containerd.WithNewSpec(specOpts...),
+	}
+	if opts.AdoptableSandbox {
+		containerOpts = append(containerOpts, containerd.WithContainerLabels(adoptableLabels(opts.Identity)))
 	}
 	if opts.RuneRuntime {
 		containerOpts = append(containerOpts, containerd.WithRuntime(runeRuntimeName, nil))
