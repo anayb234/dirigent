@@ -134,22 +134,48 @@ func acquireBundle(agentURL string) (*poolBundle, error) {
 	return &b, nil
 }
 
+// reclaimClient tolerates the pool's serialized netns rebuilds (~50ms each
+// under one mutex): a burst of reclaims queues linearly, so a 2s timeout
+// abandoned bundles under churn (measured: ~110 leaked bundles in one
+// matrix run). Reclaims are async off the hot path — a long timeout is free.
+var reclaimClient = &http.Client{Timeout: 60 * time.Second}
+
 // reclaimBundle returns a bundle to the pool. leaseID (from the /acquire
 // response) fences the reclaim: the pool ignores it if the bundle has since
 // been re-leased (ABA protection). 0 falls back to an unfenced reclaim for
-// pools that predate lease fencing.
+// pools that predate lease fencing. Retries transport errors and 5xx with
+// backoff; a 4xx (stale lease / unknown id) is terminal and logged.
 func reclaimBundle(agentURL string, bundleID int, leaseID uint64) {
 	url := fmt.Sprintf("%s/reclaim?id=%d", agentURL, bundleID)
 	if leaseID != 0 {
 		url = fmt.Sprintf("%s&lease_id=%d", url, leaseID)
 	}
-	resp, err := poolClient.Post(url, "application/json", nil)
-	if err != nil {
-		log.Printf("[worker] bundle %d reclaim failed: %v", bundleID, err)
-		return
+	var lastErr error
+	for attempt := 1; attempt <= 4; attempt++ {
+		resp, err := reclaimClient.Post(url, "application/json", nil)
+		if err == nil {
+			code := resp.StatusCode
+			resp.Body.Close()
+			if code < 300 {
+				return
+			}
+			if code < 500 {
+				log.Printf("[worker] bundle %d reclaim rejected (status %d, lease %d) — not retrying", bundleID, code, leaseID)
+				return
+			}
+			lastErr = fmt.Errorf("status %d", code)
+		} else {
+			lastErr = err
+		}
+		time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
 	}
-	resp.Body.Close()
+	log.Printf("[worker] bundle %d reclaim FAILED after retries: %v — janitor will retry", bundleID, lastErr)
+	failedReclaims.Store(bundleID, sandboxBundle{id: bundleID, lease: leaseID})
 }
+
+// failedReclaims holds bundles whose reclaim exhausted retries; the janitor
+// retries them until the pool accepts (or fences) them.
+var failedReclaims sync.Map
 
 // CreateRequest is the JSON body for POST /sandbox/create.
 type CreateRequest struct {
@@ -316,10 +342,12 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	startJanitor(runtime)
 	mux.HandleFunc("/sandbox/create", handleCreate(runtime))
 	mux.HandleFunc("/sandbox/delete", handleDelete(runtime))
 	mux.HandleFunc("/sandbox/list", handleList(runtime))
 	mux.HandleFunc("/sandbox/precreate", handlePrecreate(runtime))
+	mux.HandleFunc("/sandbox/parked", handleParked)
 	mux.HandleFunc("/sandbox/drain", handleDrain(runtime))
 	mux.HandleFunc("/cgroup/prepare", handleCgroupPrepare)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -747,6 +775,67 @@ func handlePrecreate(runtime *ctrd.ContainerdRuntime) http.HandlerFunc {
 	}
 }
 
+// startJanitor sweeps every 30s: (1) re-attempts reclaims that exhausted
+// their inline retries; (2) reclaims bundles whose sandbox has vanished
+// without its delete consuming the mapping (two consecutive absent sweeps
+// before acting, to avoid racing in-flight transitions). Catch-all for the
+// leak class where Stop succeeds but the reclaim never lands.
+func startJanitor(runtime *ctrd.ContainerdRuntime) {
+	go func() {
+		suspect := map[string]bool{}
+		for {
+			time.Sleep(30 * time.Second)
+			if *poolAgent == "" {
+				continue
+			}
+			failedReclaims.Range(func(k, v interface{}) bool {
+				failedReclaims.Delete(k)
+				b := v.(sandboxBundle)
+				go reclaimBundle(*poolAgent, b.id, b.lease)
+				return true
+			})
+			list, err := runtime.ListEndpoints(context.Background(), &emptypb.Empty{})
+			if err != nil {
+				continue
+			}
+			live := map[string]bool{}
+			for _, e := range list.Endpoint {
+				live[e.SandboxID] = true
+			}
+			next := map[string]bool{}
+			sandboxBundles.Range(func(k, v interface{}) bool {
+				id := k.(string)
+				if live[id] {
+					return true
+				}
+				if !suspect[id] {
+					next[id] = true
+					return true
+				}
+				if raw, ok := sandboxBundles.LoadAndDelete(id); ok {
+					b := raw.(sandboxBundle)
+					log.Printf("[worker] janitor: sandbox %s gone without delete — reclaiming bundle %d", id, b.id)
+					go reclaimBundle(*poolAgent, b.id, b.lease)
+				}
+				return true
+			})
+			suspect = next
+		}
+	}()
+}
+
+// handleParked reports the current parked (precreated) slot depth per image,
+// so a replay re-armer can observe and sustain park targets.
+func handleParked(w http.ResponseWriter, r *http.Request) {
+	precreatedMu.Lock()
+	counts := make(map[string]int, len(precreatedPool))
+	for img, slots := range precreatedPool {
+		counts[img] = len(slots)
+	}
+	precreatedMu.Unlock()
+	jsonResp(w, http.StatusOK, counts)
+}
+
 // handleDrain tears down all parked precreated sandboxes and reclaims their
 // bundles. Benchmark hygiene between runs.
 func handleDrain(runtime *ctrd.ContainerdRuntime) http.HandlerFunc {
@@ -845,17 +934,24 @@ func handleDelete(runtime *ctrd.ContainerdRuntime) http.HandlerFunc {
 			ID:       req.ID,
 			HostPort: int32(req.HostPort),
 		})
+		// Reclaim the backing bundle even when DeleteSandbox errors: a
+		// partially-torn-down sandbox (removed from metadata but erroring on
+		// some step, or a retry hitting "not found") must not strand its
+		// bundle — that was a measured leak (~110 bundles/run). The caller
+		// only deletes finished workloads, so the bundle is dead either way;
+		// the pool's rebuild refreshes the netns regardless of what the
+		// half-deleted sandbox left behind.
+		if raw, ok := sandboxBundles.LoadAndDelete(req.ID); ok && *poolAgent != "" {
+			if b, ok := raw.(sandboxBundle); ok {
+				if err != nil {
+					log.Printf("[worker] delete %s errored (%v) — reclaiming bundle %d anyway", req.ID, err, b.id)
+				}
+				go reclaimBundle(*poolAgent, b.id, b.lease)
+			}
+		}
 		if err != nil {
 			jsonError(w, err.Error(), http.StatusInternalServerError)
 			return
-		}
-
-		// If this sandbox was backed by a pool bundle, return it to the pool
-		// (fenced by the lease it was acquired under).
-		if raw, ok := sandboxBundles.LoadAndDelete(req.ID); ok && *poolAgent != "" {
-			if b, ok := raw.(sandboxBundle); ok {
-				go reclaimBundle(*poolAgent, b.id, b.lease)
-			}
 		}
 
 		// Remove the adopted pod cgroup (retries until the killed PIDs drain).
